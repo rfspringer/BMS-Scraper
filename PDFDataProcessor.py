@@ -1,16 +1,18 @@
 import os
 import re
-import pandas as pd
-import PyPDF2
-from typing import List, Dict, Union
+import csv
 import logging
-import camelot
+from typing import List, Dict, Union
+import pytesseract
+from pdf2image import convert_from_path
+from datetime import datetime
+from pathlib import Path
 
 
 class PDFDataProcessor:
     def __init__(self, log_level=logging.INFO):
         """
-        Initialize the processor with optional logging.
+        Initialize the processor with optional logging and regex patterns.
 
         Args:
             log_level (int): Logging level, defaults to INFO
@@ -22,131 +24,249 @@ class PDFDataProcessor:
         self.logger = logging.getLogger(__name__)
 
         # Compile regex patterns for efficiency
-        self.patterns = {
-            'case_number': re.compile(r'BMS Case No\. (\S+)'),
-            'eligible_employees': re.compile(r'ELIGIBLE EMPLOYEES \((\d+)\)'),
-            'total_votes': re.compile(r'TOTAL VOTES TABULATED \((\d+)\)'),
-            'date': re.compile(r'(\w+ \d{1,2}, \d{4})')
-        }
+        self.patterns = self._compile_patterns()
 
-    def extract_table(self, pdf_path: str) -> pd.DataFrame:
+    def _compile_patterns(self) -> Dict[str, re.Pattern]:
         """
-        Extract tables from the PDF file.
-
-        Args:
-            pdf_path (str): Path to the PDF file
+        Compile regex patterns used for extracting specific information from the PDFs.
 
         Returns:
-            pd.DataFrame: DataFrame containing extracted table data
+            dict: Dictionary containing compiled regex patterns for various fields.
         """
-        try:
-            tables = camelot.read_pdf(pdf_path, pages="all", flavor="stream")  # Change flavor to "lattice" if PDF has gridlines
-            if tables:
-                self.logger.info(f"Extracted {len(tables)} tables from {pdf_path}")
-                # Combine all tables into a single DataFrame
-                combined_table = pd.concat([table.df for table in tables], ignore_index=True)
-                return combined_table
+        return {
+            'Unit Name': re.compile(r'(?:falling\s+within\s+the\s+appropriate\s+unit\s*(?:of)?:|Page Two\s*)\s*(?:[^A]\d{3}.*?\n)*?(All.*?)(?=(?:The Maintenance|STATE OF MINNESOTA|An Equal Opportunity|Commissioner|1380))', re.DOTALL),            'Case Number': re.compile(r'BMS Case No\. (\S+)'),
+            'Num. Eligible Employees': re.compile(r'ELIGIBLE EMPLOYEES \((\d+)\)'),
+            'Total Votes': re.compile(r'TOTAL VOTES TABULATED \((\d+)\)'),
+            'Document Date': re.compile(r'(\w+ \d{1,2}, \d{4})'),
+            'Issuance Date': re.compile(r'issued by the Bureau on (\w+ \d{1,2}, \d{4})'),
+            'Petition Type': re.compile(r'IN THE MATTER OF A PETITION FOR\s+(.*?)(?=\s+\b[A-Za-z]+\s+\d{1,2}, \d{4}\b)', re.DOTALL),
+        }
+
+    def _extract_text_from_pdf(self, pdf_path: str) -> str:
+        """
+        Extract text from a PDF using OCR.
+
+        Args:
+            pdf_path (str): Path to the PDF file.
+
+        Returns:
+            str: Extracted text from the PDF.
+        """
+        images = convert_from_path(pdf_path)
+        full_text = ""
+
+        for page_number, image in enumerate(images, start=1):
+            page_text = pytesseract.image_to_string(image)
+            if page_text.strip():
+                full_text += page_text + "\n"
             else:
-                self.logger.warning(f"No tables found in {pdf_path}")
-                return pd.DataFrame()
-        except Exception as e:
-            self.logger.error(f"Error extracting tables from {pdf_path}: {e}")
-            return pd.DataFrame()
+                self.logger.warning(f"No text extracted from page {page_number}")
 
-    def parse_votes_from_table(self, table: pd.DataFrame) -> Dict[str, Union[str, int]]:
+        return full_text
+
+    def _clean_extracted_patterns(self, text: str, key):
+        text = re.sub(r'\n+', ' ', text)  # Replace multiple newlines with a single space
+        text = re.sub(r' +', ' ', text)  # Replace multiple spaces with a single space
+
+        # Convert numeric values to int if applicable
+        if text.isdigit():
+            return int(text)
+        # Convert dates to a standard format if applicable
+        elif key in {'Document Date', 'Issuance Date'}:
+            try:
+                return datetime.strptime(text, '%B %d, %Y').date()
+            except ValueError:
+                pass  # Leave the value as is if parsing fails
+
+        return text
+
+    def _get_unit_location_from_unit_name(self, unit_name_text: str):
+        pattern = re.compile(
+            r'\b([A-Za-z\s\-]+,\s*Minnesota)\b',
+            re.IGNORECASE | re.DOTALL
+        )
+        match = pattern.search(unit_name_text)
+        if match:
+            location = match.group(1).strip()
+            location = self._clean_extracted_patterns(location, 'Unit Location')
+            return location
+        else:
+            return None
+
+    def _extract_matching_patterns(self, text: str) -> Dict[str, Union[str, int]]:
         """
-        Parse vote information from the extracted table.
+        Extract specific matching patterns from the text using regex patterns.
 
         Args:
-            table (pd.DataFrame): DataFrame containing the table data
+            text (str): Extracted text from the PDF.
 
         Returns:
-            Dict: Parsed vote information
+            dict: Dictionary of extracted values.
         """
-        votes_data = {
-            'group_1': '',
-            'group_2': '',
-            'num_votes_group_1': 0,
-            'num_votes_group_2': 0,
-            'num_votes_no_rep': 0
-        }
+        results = {}
 
-        # Iterate over rows and look for vote-related information
-        for _, row in table.iterrows():
-            row_text = " ".join(row.astype(str)).lower()
-            if "votes for" in row_text:
-                group_name = re.search(r'votes for (.+?) \(\d+\)', row_text)
-                votes_count = re.search(r'\((\d+)\)', row_text)
+        for key, pattern in self.patterns.items():
+            match = pattern.search(text)
+            if match:
+                value = match.group(1).strip()
+                value = self._clean_extracted_patterns(value, key)
+                results[key] = value
 
-                if group_name and votes_count:
-                    group_name = group_name.group(1).strip()
-                    votes_count = int(votes_count.group(1))
-                    if "no representative" in group_name.lower():
-                        votes_data['num_votes_no_rep'] = votes_count
-                    elif not votes_data['group_a']:
-                        votes_data['group_a'] = group_name
-                        votes_data['num_votes_group_1'] = votes_count
-                    elif not votes_data['group_b']:
-                        votes_data['group_b'] = group_name
-                        votes_data['num_votes_group_2'] = votes_count
+        if 'Unit Name' in results:
+            results['Unit Location'] = self._get_unit_location_from_unit_name(results['Unit Name'])
+        else:
+            pass
+        return results
 
-        return votes_data
-
-    def process_single_pdf(self, pdf_path: str, failed_pdfs: List[str]) -> Dict[str, Union[str, int]]:
+    def _extract_voting_results(self, text: str) -> Dict[str, Union[str, int]]:
         """
-        Process a single PDF file and extract election data.
+        Extract voting results from the text.
 
         Args:
-            pdf_path (str): Path to the PDF file
-            failed_pdfs (List[str]): List to record failed PDFs
+            text (str): Extracted text from the PDF.
 
         Returns:
-            dict: Extracted election data
+            dict: Dictionary containing voting results.
         """
-        try:
-            table = self.extract_table(pdf_path)
-            if table.empty:
-                raise ValueError("No table data extracted")
-
-            votes_data = self.parse_votes_from_table(table)
-
-            # Combine results
-            data = {
-                'filename': os.path.basename(pdf_path),
-                'case_number': self.extract_case_number(' '.join(table.astype(str).values.flatten())),
-                'date': self.extract_issue_date(' '.join(table.astype(str).values.flatten())),
-                'petition_type': 'Unknown',  # Adjust if you have logic to extract this
-                **votes_data
-            }
-
-            self.logger.info(f"Successfully processed {pdf_path}")
-            return data
-
-        except Exception as e:
-            self.logger.error(f"Error processing {pdf_path}: {e}")
-            failed_pdfs.append(pdf_path)
+        voting_section_match = re.search(r'ELIGIBLE EMPLOYEES\s*\((\d+)\)(.*?)TOTAL VOTES TABULATED', text, re.DOTALL)
+        if not voting_section_match:
             return {}
 
-    def extract_case_number(self, text: str) -> str:
-        match = self.patterns['case_number'].search(text)
-        return match.group(1) if match else ''
+        voting_section = voting_section_match.group(2).replace('\n', ' ').strip()
+        vote_pattern = r'(.*?)\s*\(\s*(\d+)\s*\)'
 
-    def extract_issue_date(self, text: str) -> str:
-        match = self.patterns['date'].search(text)
-        return match.group(1) if match else ''
+        votes = re.findall(vote_pattern, voting_section)
+        result = {f'Group {i}': None for i in range(1, 4)}
+        result.update({f'Group {i} Votes': None for i in range(1, 4)})
+        result['No Representative Votes'] = None
 
-    # Other helper functions remain the same
+        group_index = 1
+        for group, vote_count in votes:
+            group = group.strip()
+            group = re.sub(r'^VOTES FOR\s*', '', group, flags=re.IGNORECASE)
 
-# Example usage
+            if 'no representative' in group.lower():
+                result['No Representative Votes'] = int(vote_count)
+                break
+            else:
+                result[f'Group {group_index}'] = group
+                result[f'Group {group_index} Votes'] = int(vote_count)
+                group_index += 1
+
+        return result
+
+    def _extract_representation_results(self, text: str) -> Dict[str, Union[str, bool]]:
+        """
+        Extract the representation status and group name from the text.
+
+        Args:
+            text (str): Extracted text from the PDF.
+
+        Returns:
+            dict: Dictionary containing representation results.
+        """
+        pattern = re.compile(
+            r'CERTIFIED\s+THAT\s+(.*?)\s*,?\s*is?\s*(NOT\s+)?\s*the\s+exclusive\s+representative',
+            re.IGNORECASE | re.DOTALL
+        )
+        match = pattern.search(text)
+
+        if match:
+            group_name = match.group(1).strip().replace("\n", " ").split(',', 1)[0].strip()
+            is_exclusive = match.group(2) is None
+            return {
+                "Chose Representative": is_exclusive,
+                "Result": group_name if is_exclusive else 'No Representative'
+            }
+
+        return {}
+
+    def _get_pdf_link(self, pdf_path):
+        file_name = Path(pdf_path).name
+        return 'https://mn.gov/bms/assets/' + file_name
+
+    def process_single_pdf(self, pdf_path: str) -> Dict[str, Union[str, int]]:
+        """
+        Process a single PDF and extract data.
+
+        Args:
+            pdf_path (str): Path to the PDF file.
+
+        Returns:
+            dict: Extracted data.
+        """
+        text = self._extract_text_from_pdf(pdf_path)
+        results = {}
+
+        results['PDF Link'] = self._get_pdf_link(pdf_path)
+        results.update(self._extract_matching_patterns(text))
+        results.update(self._extract_voting_results(text))
+        results.update(self._extract_representation_results(text))
+
+        return results
+
+    def process_pdfs_in_folder(self, folder_path: str) -> List[Dict[str, Union[str, int]]]:
+        """
+        Process all PDFs in a folder and extract data.
+
+        Args:
+            folder_path (str): Path to the folder containing PDFs.
+
+        Returns:
+            list: List of dictionaries containing election data from each PDF.
+        """
+        pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+        all_results = []
+
+        for pdf_file in pdf_files:
+            pdf_path = os.path.join(folder_path, pdf_file)
+            self.logger.info(f"Processing file: {pdf_file}")
+            result = self.process_single_pdf(pdf_path)
+            all_results.append(result)
+
+        return all_results
+
+    def save_results_to_csv(self, results: List[Dict[str, Union[str, int]]], output_file: str) -> None:
+        """
+        Save the extracted results to a CSV file.
+
+        Args:
+            results (list): List of dictionaries containing extracted election data.
+            output_file (str): Path to the CSV file to save the results.
+
+        Returns:
+            None
+        """
+        if not results:
+            self.logger.warning("No results to save.")
+            return
+
+        headers = ['Case Number', 'Document Date', 'Unit Name', 'Unit Location', 'Petition Type', 'Issuance Date', 'Num. Eligible Employees', 'Group 1', 'Group 2', 'Group 3', 'Group 1 Votes', 'Group 2 Votes', 'Group 3 Votes', 'No Representative Votes', 'Total Votes' 'Result', 'Chose representative', 'PDF Link']
+
+        # Write results to CSV
+        with open(output_file, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=headers)
+            writer.writeheader()
+            for result in results:
+                writer.writerow(result)
+
+        self.logger.info(f"Results saved to {output_file}")
+
+
 def main():
+    folder_path = './downloads'
     processor = PDFDataProcessor()
-    # Example: processor.process_single_pdf('/path/to/pdf', [])
-    pass
+
+    results = processor.process_pdfs_in_folder(folder_path)
+    processor.save_results_to_csv(results, 'outputs.csv')
+
+
+    for result in results:
+        print(result)
+
 
 if __name__ == "__main__":
     main()
 
 
-    # mark if is "law enforcement union"
-    # print last date
-
+    # RUN ALL INTO DOC
