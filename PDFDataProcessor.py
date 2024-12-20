@@ -7,6 +7,7 @@ import pytesseract
 from pdf2image import convert_from_path
 from datetime import datetime
 from pathlib import Path
+import pandas as pd
 
 
 class PDFDataProcessor:
@@ -241,14 +242,23 @@ class PDFDataProcessor:
             self.logger.warning("No results to save.")
             return
 
-        headers = ['Case Number', 'Document Date', 'Unit Name', 'Unit Location', 'Petition Type', 'Issuance Date', 'Num. Eligible Employees', 'Group 1', 'Group 2', 'Group 3', 'Group 1 Votes', 'Group 2 Votes', 'Group 3 Votes', 'No Representative Votes', 'Total Votes' 'Result', 'Chose representative', 'PDF Link']
+        headers = ['Case Number', 'Document Date', 'Unit Name', 'Unit Location', 'Petition Type', 'Issuance Date',
+                   'Num. Eligible Employees', 'Group 1', 'Group 2', 'Group 3', 'Group 1 Votes', 'Group 2 Votes', 'Group 3 Votes',
+                   'No Representative Votes', 'Total Votes', 'Result', 'Chose Representative', 'PDF Link']
 
-        # Write results to CSV
-        with open(output_file, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=headers)
-            writer.writeheader()
-            for result in results:
-                writer.writerow(result)
+        # Convert the list of dictionaries to a DataFrame
+        df = pd.DataFrame(results)
+
+        # Ensure that all the necessary columns are in the DataFrame (fill missing columns with empty strings or None)
+        for header in headers:
+            if header not in df.columns:
+                df[header] = None
+
+        # Reorder columns to match the header list
+        df = df[headers]
+
+        # Write to CSV
+        df.to_csv(output_file, index=False, encoding='utf-8')
 
         self.logger.info(f"Results saved to {output_file}")
 
